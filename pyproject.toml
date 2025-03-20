@@ -13,11 +13,20 @@ authors = [
 license = "CC0-1.0"
 requires-python = ">=3.6"
 
-[tool.setuptools]
-py_modules = ["download_dandi_sample", "spikesort", "spike_sort_run"]
 
 [project.urls]
 Homepage = "https://github.com/NileshArnaiya/Speed-Spike-Sort"
 
 [project.scripts]
 speed-spike-sort = "spike_sort_run:main"
+
+[tool.setuptools]
+packages = []
+
+[tool.setuptools.package-data]
+"*" = ["*.npy"]
+
+[tool.setuptools.py-modules]
+download_dandi_sample = "download_dandi_sample"
+spikesort = "spikesort"
+spike_sort_run = "spike_sort_run"
