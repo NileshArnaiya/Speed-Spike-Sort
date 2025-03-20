@@ -21,9 +21,6 @@ Homepage = "https://github.com/NileshArnaiya/Speed-Spike-Sort"
 speed-spike-sort = "spike_sort_run:main"
 
 [tool.setuptools]
-packages = []
-
-[tool.setuptools]
 py-modules = [
     "download_dandi_sample",
     "spikesort",
