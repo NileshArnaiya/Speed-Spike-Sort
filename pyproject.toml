@@ -23,10 +23,12 @@ speed-spike-sort = "spike_sort_run:main"
 [tool.setuptools]
 packages = []
 
+[tool.setuptools]
+py-modules = [
+    "download_dandi_sample",
+    "spikesort",
+    "spike_sort_run"
+]
+
 [tool.setuptools.package-data]
 "*" = ["*.npy"]
-
-[tool.setuptools.py-modules]
-download_dandi_sample = "download_dandi_sample"
-spikesort = "spikesort"
-spike_sort_run = "spike_sort_run"
