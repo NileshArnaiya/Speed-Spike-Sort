@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "speed-spike-sort"
 version = "0.1.0"
-description = "High-performance framework for neural spike sorting of electrophysiological data"
+description = "Spike sorting pipeline for extracellular electrophysiology recordings"
 readme = "README.md"
 authors = [
     {name = "NileshArnaiya"}

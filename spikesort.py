@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SpeedSort: High-Performance Neural Spike Sorting Framework
-----------------------------------------------------------
+Spike sorting pipeline for extracellular electrophysiology recordings.
 
-This module provides a comprehensive, high-performance framework for neural spike 
-sorting with minimal configuration requirements while maintaining flexibility.
+Takes a raw neural recording (numpy array, .npy, .nwb, .mda, or binary file)
+and produces sorted spike units through these steps:
 
-Core features:
-- Universal data format handling with automatic detection
-- GPU-accelerated preprocessing and clustering when available
-- Adaptive dimensionality reduction and feature selection
-- Parallelized processing for multi-channel recordings
-- Integrated quality metrics with automated unit verification
-- Minimal configuration with intelligent defaults
+    1. Bandpass + notch filtering (default 300-6000 Hz)
+    2. Spike detection (threshold, adaptive threshold, NEO, wavelet, or neural net)
+    3. Waveform extraction around each detected spike
+    4. Dimensionality reduction (PCA, t-SNE, UMAP, or wavelet coefficients)
+    5. Clustering into units (K-means, GMM, DBSCAN, mean shift, etc.)
+    6. Quality metrics (isolation distance, contamination rate)
+
+Uses GPU (PyTorch/CuPy) automatically when available, otherwise falls back to NumPy.
 """
 
 import os
@@ -191,6 +191,14 @@ class SpikeSortingConfiguration:
     max_clusters: int = 50                    # Maximum number of clusters to consider
     min_cluster_size: int = 30                # Minimum spikes per cluster
     
+    # Preprocessing — applied after bandpass filtering (requires ≥4 channels)
+    detect_bad_channels: bool = True          # Detect and interpolate dead/noisy channels
+    bad_channel_std_threshold: float = 5.0    # Channels outside this many MADs from median variance are bad
+    common_reference: bool = True             # Apply common average/median reference
+    common_reference_type: str = 'median'     # 'median' or 'mean'
+    whiten: bool = True                       # Apply whitening transform
+    min_channels_for_preprocessing: int = 4   # Skip CAR/whitening/bad-ch if fewer channels
+    
     # Quality metrics and validation
     compute_quality_metrics: bool = True      # Calculate quality metrics
     isolation_threshold: float = 0.9          # Minimum isolation score to accept
@@ -261,7 +269,6 @@ class SpikeSortingResults:
         """Count number of units per channel."""
         channel_counts = {}
         for unit in self.units:
-            # Get primary channel for this unit
             if len(unit.channel_ids) > 0:
                 primary_channel = unit.channel_ids[0]
                 channel_counts[primary_channel] = channel_counts.get(primary_channel, 0) + 1
@@ -272,15 +279,224 @@ class SpikeSortingResults:
         rates = {}
         if not self.units:
             return rates
-            
-        # Calculate recording duration in seconds
         max_time = max(max(unit.timestamps) for unit in self.units if len(unit.timestamps) > 0)
         duration_seconds = max_time / self.sampling_rate
-        
         for unit in self.units:
             rates[unit.unit_id] = len(unit.timestamps) / duration_seconds if duration_seconds > 0 else 0
-            
         return rates
+    
+    # ------------------------------------------------------------------
+    # Pynapple / NWB export
+    # ------------------------------------------------------------------
+    
+    def to_pynapple(self):
+        """Convert sorted units to a pynapple TsGroup for downstream analysis.
+        
+        Returns:
+            nap.TsGroup with one Ts per unit, timestamps in seconds.
+        
+        Raises:
+            ImportError: if pynapple is not installed.
+        """
+        import pynapple as nap
+        spike_dict = {}
+        for i, unit in enumerate(self.units):
+            times_sec = unit.timestamps.astype(np.float64) / self.sampling_rate
+            spike_dict[i] = nap.Ts(t=times_sec)
+        return nap.TsGroup(spike_dict)
+    
+    def to_nwb(self, filepath: str, session_description: str = "SpeedSort output") -> None:
+        """Write sorted units to an NWB file with spike times and quality metrics.
+        
+        Args:
+            filepath: output .nwb file path.
+            session_description: description stored in the NWB file.
+        
+        Raises:
+            ImportError: if pynwb is not installed.
+        """
+        from pynwb import NWBFile, NWBHDF5IO
+        from datetime import datetime
+        from dateutil.tz import tzlocal
+        
+        nwbfile = NWBFile(
+            session_description=session_description,
+            identifier=f"speedsort_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            session_start_time=datetime.now(tzlocal()),
+        )
+        nwbfile.add_unit_column(name='snr', description='Signal-to-noise ratio')
+        nwbfile.add_unit_column(name='firing_rate', description='Firing rate (Hz)')
+        nwbfile.add_unit_column(name='isi_violations_ratio', description='Fraction of ISI violations')
+        nwbfile.add_unit_column(name='isolation_distance', description='Mahalanobis isolation distance')
+        
+        for unit in self.units:
+            spike_times_sec = unit.timestamps.astype(np.float64) / self.sampling_rate
+            qm = unit.quality_metrics or {}
+            nwbfile.add_unit(
+                spike_times=spike_times_sec,
+                snr=qm.get('snr', 0.0),
+                firing_rate=qm.get('firing_rate', 0.0),
+                isi_violations_ratio=qm.get('isi_violations_ratio', 0.0),
+                isolation_distance=qm.get('isolation_distance', 0.0),
+            )
+        
+        with NWBHDF5IO(filepath, 'w') as io:
+            io.write(nwbfile)
+        logger.info(f"NWB file saved to {filepath}")
+    
+    # ------------------------------------------------------------------
+    # Post-processing: correlograms and ISI histograms
+    # ------------------------------------------------------------------
+    
+    def _get_unit_by_id(self, unit_id: int) -> SpikeUnit:
+        """Look up a unit by its ID. Raises ValueError if not found."""
+        for unit in self.units:
+            if unit.unit_id == unit_id:
+                return unit
+        raise ValueError(f"Unit {unit_id} not found")
+    
+    def compute_acg(self, unit_id: int, bin_size_ms: float = 0.5, window_ms: float = 50.0) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute auto-correlogram for a unit.
+        
+        Args:
+            unit_id: which unit.
+            bin_size_ms: histogram bin width in ms.
+            window_ms: half-window size in ms.
+        
+        Returns:
+            (counts, bin_edges_ms) — counts has the zero-lag bin removed.
+        """
+        unit = self._get_unit_by_id(unit_id)
+        times_ms = unit.timestamps.astype(np.float64) / self.sampling_rate * 1000.0
+        times_ms = np.sort(times_ms)
+        
+        n_bins = int(window_ms / bin_size_ms)
+        bin_edges = np.linspace(-window_ms, window_ms, 2 * n_bins + 1)
+        counts = np.zeros(len(bin_edges) - 1, dtype=np.int64)
+        
+        for i in range(len(times_ms)):
+            diffs = times_ms[i+1:] - times_ms[i]
+            valid = diffs[diffs <= window_ms]
+            if len(valid) == 0:
+                continue
+            # positive lags
+            idx = np.searchsorted(bin_edges, valid) - 1
+            idx = idx[(idx >= 0) & (idx < len(counts))]
+            for j in idx:
+                counts[j] += 1
+            # mirror for negative lags
+            neg = -valid
+            idx_neg = np.searchsorted(bin_edges, neg) - 1
+            idx_neg = idx_neg[(idx_neg >= 0) & (idx_neg < len(counts))]
+            for j in idx_neg:
+                counts[j] += 1
+        
+        # Remove zero-lag bin
+        zero_bin = n_bins
+        counts[zero_bin] = 0
+        
+        return counts, bin_edges
+    
+    def compute_ccg(self, unit_id_a: int, unit_id_b: int, bin_size_ms: float = 0.5, window_ms: float = 50.0) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute cross-correlogram between two units.
+        
+        Returns:
+            (counts, bin_edges_ms)
+        """
+        unit_a = self._get_unit_by_id(unit_id_a)
+        unit_b = self._get_unit_by_id(unit_id_b)
+        times_a = np.sort(unit_a.timestamps.astype(np.float64) / self.sampling_rate * 1000.0)
+        times_b = np.sort(unit_b.timestamps.astype(np.float64) / self.sampling_rate * 1000.0)
+        
+        n_bins = int(window_ms / bin_size_ms)
+        bin_edges = np.linspace(-window_ms, window_ms, 2 * n_bins + 1)
+        counts = np.zeros(len(bin_edges) - 1, dtype=np.int64)
+        
+        j_start = 0
+        for i in range(len(times_a)):
+            while j_start < len(times_b) and times_b[j_start] < times_a[i] - window_ms:
+                j_start += 1
+            j = j_start
+            while j < len(times_b) and times_b[j] <= times_a[i] + window_ms:
+                diff = times_b[j] - times_a[i]
+                bin_idx = int((diff + window_ms) / bin_size_ms)
+                if 0 <= bin_idx < len(counts):
+                    counts[bin_idx] += 1
+                j += 1
+        
+        return counts, bin_edges
+    
+    def compute_isi_histogram(self, unit_id: int, bin_size_ms: float = 0.5, max_isi_ms: float = 100.0) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute inter-spike-interval histogram for a unit.
+        
+        Returns:
+            (counts, bin_edges_ms)
+        """
+        unit = self._get_unit_by_id(unit_id)
+        times_ms = np.sort(unit.timestamps.astype(np.float64) / self.sampling_rate * 1000.0)
+        isis = np.diff(times_ms)
+        
+        bin_edges = np.arange(0, max_isi_ms + bin_size_ms, bin_size_ms)
+        counts, _ = np.histogram(isis, bins=bin_edges)
+        return counts, bin_edges
+    
+    def plot_unit_summary(self, unit_id: int, save_path: Optional[str] = None) -> None:
+        """Plot 3-panel summary for a unit: mean waveform, auto-correlogram, ISI histogram.
+        
+        Args:
+            unit_id: which unit to plot.
+            save_path: if provided, saves figure to this path instead of showing.
+        """
+        import matplotlib.pyplot as plt
+        
+        unit = self._get_unit_by_id(unit_id)
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        fig.suptitle(f'Unit {unit_id}', fontsize=14)
+        
+        # Panel 1: Mean waveform
+        ax = axes[0]
+        if unit.waveforms is not None and len(unit.waveforms) > 0:
+            if unit.waveforms.ndim == 3:
+                mean_wf = np.mean(unit.waveforms, axis=0)
+                peak_ch = np.argmax(np.max(np.abs(mean_wf), axis=0))
+                wf = mean_wf[:, peak_ch]
+            elif unit.waveforms.ndim == 2:
+                wf = np.mean(unit.waveforms, axis=0)
+            else:
+                wf = unit.waveforms.flatten()
+            time_axis = np.arange(len(wf)) / self.sampling_rate * 1000
+            ax.plot(time_axis, wf, 'k-', linewidth=1.5)
+            ax.set_xlabel('Time (ms)')
+            ax.set_ylabel('Amplitude')
+        ax.set_title('Mean waveform')
+        
+        # Panel 2: Auto-correlogram
+        ax = axes[1]
+        acg_counts, acg_bins = self.compute_acg(unit_id)
+        bin_centers = (acg_bins[:-1] + acg_bins[1:]) / 2
+        ax.bar(bin_centers, acg_counts, width=acg_bins[1] - acg_bins[0], color='steelblue', edgecolor='none')
+        ax.set_xlabel('Lag (ms)')
+        ax.set_ylabel('Count')
+        ax.set_title('Auto-correlogram')
+        
+        # Panel 3: ISI histogram
+        ax = axes[2]
+        isi_counts, isi_bins = self.compute_isi_histogram(unit_id)
+        bin_centers = (isi_bins[:-1] + isi_bins[1:]) / 2
+        ax.bar(bin_centers, isi_counts, width=isi_bins[1] - isi_bins[0], color='coral', edgecolor='none')
+        # Mark refractory period
+        ax.axvline(1.5, color='red', linestyle='--', alpha=0.7, label='1.5ms refractory')
+        ax.set_xlabel('ISI (ms)')
+        ax.set_ylabel('Count')
+        ax.set_title('ISI histogram')
+        ax.legend(fontsize=8)
+        
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"Unit summary plot saved to {save_path}")
+        else:
+            plt.show()
 
 
 # ------------------------------------------------------------------------------
@@ -288,21 +504,10 @@ class SpikeSortingResults:
 # ------------------------------------------------------------------------------
 
 class SpeedSort:
-    """
-    Main class for the SpeedSort spike sorting framework.
-    
-    This class orchestrates the entire spike sorting pipeline, from data loading
-    to waveform extraction, feature computation, clustering, and quality assessment.
-    """
+    """Runs the full spike sorting pipeline: load → filter → detect → extract → cluster → score."""
     
     def __init__(self, config: Optional[SpikeSortingConfiguration] = None):
-        """
-        Initialize the SpeedSort processor.
-        
-        Args:
-            config: Configuration object with spike sorting parameters.
-                   If None, uses default configuration.
-        """
+        """Initialize with a SpikeSortingConfiguration (uses defaults if None)."""
         self.config = config or SpikeSortingConfiguration()
         self.results = None
         
@@ -314,7 +519,7 @@ class SpeedSort:
         self.end_time = None
     
     def _initialize_backends(self) -> None:
-        """Initialize the appropriate computational backends based on configuration."""
+        """Set up the array backend (NumPy, CuPy, or PyTorch) based on config."""
         # Initialize array module (numpy, torch, or cupy)
         if self.config.backend == ProcessingBackend.CUPY and _HAS_CUPY:
             self.xp = cp
@@ -335,16 +540,7 @@ class SpeedSort:
             self.device = torch.device('cpu')
     
     def run(self, data: Union[str, np.ndarray, Path], sampling_rate: Optional[float] = None) -> SpikeSortingResults:
-        """
-        Run the complete spike sorting pipeline.
-        
-        Args:
-            data: Input data, can be a file path or numpy array
-            sampling_rate: Sampling rate in Hz, required if data is a numpy array
-        
-        Returns:
-            SpikeSortingResults object containing sorted units and metrics
-        """
+        """Run the full pipeline on a recording file or numpy array. Returns SpikeSortingResults."""
         # Start timing
         self.start_time = time.time()
         
@@ -361,6 +557,26 @@ class SpeedSort:
         
         # Step 2: Filter the data
         filtered_data = self._filter_data(raw_data)
+        
+        n_ch = filtered_data.shape[1]
+        has_enough_channels = n_ch >= self.config.min_channels_for_preprocessing
+        
+        # Step 2b: Bad channel detection & interpolation
+        if self.config.detect_bad_channels and has_enough_channels:
+            logger.info("Detecting bad channels...")
+            filtered_data = self._detect_and_fix_bad_channels(filtered_data)
+        
+        # Step 2c: Common average reference
+        if self.config.common_reference and has_enough_channels:
+            logger.info(f"Applying common {self.config.common_reference_type} reference...")
+            filtered_data = self._apply_common_reference(filtered_data)
+        
+        # Step 2d: Whitening
+        if self.config.whiten and has_enough_channels:
+            logger.info("Applying whitening transform...")
+            filtered_data = self._apply_whitening(filtered_data)
+        elif self.config.whiten and not has_enough_channels:
+            logger.info(f"Skipping preprocessing (CAR/whiten/bad-ch): only {n_ch} channels, need ≥{self.config.min_channels_for_preprocessing}")
         
         # Step 3: Detect spikes
         logger.info("Detecting spikes...")
@@ -410,16 +626,7 @@ class SpeedSort:
         return self.results
 
     def _load_data(self, data: Union[str, np.ndarray, Path], sampling_rate: Optional[float] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """
-        Load data from file or array.
-        
-        Args:
-            data: Input data, can be a file path or numpy array
-            sampling_rate: Sampling rate in Hz, required if data is a numpy array
-        
-        Returns:
-            Tuple of (data_array, data_info_dict)
-        """
+        """Load recording from file path or numpy array. Returns (samples×channels array, info dict)."""
         data_info = {}
         
         if isinstance(data, np.ndarray):
@@ -545,15 +752,7 @@ class SpeedSort:
         raise ValueError("Data must be a file path or numpy array")
 
     def _detect_data_format(self, filepath: Path) -> DataFormat:
-        """
-        Auto-detect the data format based on file extension and content.
-        
-        Args:
-            filepath: Path to the data file
-        
-        Returns:
-            Detected DataFormat
-        """
+        """Guess data format from file extension (.npy → NUMPY, .nwb → NWB, etc.)."""
         # Check by extension
         suffix = filepath.suffix.lower()
         
@@ -584,15 +783,7 @@ class SpeedSort:
         return DataFormat.BINARY
 
     def _read_mda(self, filepath: Path) -> np.ndarray:
-        """
-        Read MountainSort MDA format.
-        
-        Args:
-            filepath: Path to the MDA file
-        
-        Returns:
-            NumPy array with the data
-        """
+        """Read a MountainSort .mda file and return its data as a numpy array."""
         # Basic MDA format reader
         with open(filepath, 'rb') as f:
             # Read header
@@ -623,15 +814,7 @@ class SpeedSort:
             return data
 
     def _filter_data(self, data: np.ndarray) -> np.ndarray:
-        """
-        Apply filters to the data.
-        
-        Args:
-            data: Raw data array (samples x channels)
-        
-        Returns:
-            Filtered data array
-        """
+        """Apply bandpass and optional notch filters. Input/output shape: (samples, channels)."""
         # Convert to proper array type for backend
         if isinstance(self.xp, type(np)) and not isinstance(data, np.ndarray):
             data = np.array(data)
@@ -730,16 +913,138 @@ class SpeedSort:
         
         return filtered_data
 
+    def _apply_common_reference(self, data: np.ndarray) -> np.ndarray:
+        """Subtract common average (or median) reference across channels per time sample."""
+        if isinstance(data, np.ndarray):
+            if self.config.common_reference_type == 'median':
+                ref = np.median(data, axis=1, keepdims=True)
+            else:
+                ref = np.mean(data, axis=1, keepdims=True)
+            return data - ref
+        elif _HAS_CUPY and self.xp is cp:
+            data_np = cp.asnumpy(data)
+            ref = np.median(data_np, axis=1, keepdims=True) if self.config.common_reference_type == 'median' else np.mean(data_np, axis=1, keepdims=True)
+            return cp.array(data_np - ref)
+        elif _HAS_TORCH and self.xp is torch:
+            if self.config.common_reference_type == 'median':
+                ref = torch.median(data, dim=1, keepdim=True).values
+            else:
+                ref = torch.mean(data, dim=1, keepdim=True)
+            return data - ref
+        return data
+
+    def _detect_and_fix_bad_channels(self, data: np.ndarray) -> np.ndarray:
+        """Detect dead/noisy channels via variance analysis and interpolate from neighbors.
+        
+        Bad channels are those whose variance is far outside the distribution of
+        all channel variances (using MAD-based z-score). Dead channels (near-zero
+        variance) and noisy channels (extremely high variance) are both caught.
+        Bad channels are replaced by the mean of their nearest non-bad neighbors.
+        """
+        if isinstance(data, np.ndarray):
+            data_np = data
+        elif _HAS_CUPY and self.xp is cp:
+            data_np = cp.asnumpy(data)
+        elif _HAS_TORCH and self.xp is torch:
+            data_np = data.cpu().numpy()
+        else:
+            data_np = np.array(data)
+        
+        n_channels = data_np.shape[1]
+        if n_channels < 3:
+            return data  # Need at least 3 channels for meaningful detection
+        
+        # Compute variance per channel
+        channel_vars = np.var(data_np, axis=0)
+        
+        # MAD-based detection: channels whose log-variance deviates from median
+        log_vars = np.log1p(channel_vars)
+        median_lv = np.median(log_vars)
+        mad_lv = np.median(np.abs(log_vars - median_lv))
+        if mad_lv < 1e-10:
+            mad_lv = 1e-10  # Avoid division by zero
+        
+        z_scores = np.abs(log_vars - median_lv) / mad_lv
+        bad_mask = z_scores > self.config.bad_channel_std_threshold
+        
+        # Also flag dead channels (near-zero variance)
+        dead_mask = channel_vars < np.median(channel_vars) * 0.01
+        bad_mask = bad_mask | dead_mask
+        
+        bad_indices = np.where(bad_mask)[0]
+        if len(bad_indices) == 0:
+            logger.info("No bad channels detected")
+            return data
+        
+        if len(bad_indices) >= n_channels - 1:
+            logger.warning(f"Too many bad channels detected ({len(bad_indices)}/{n_channels}), skipping correction")
+            return data
+        
+        logger.info(f"Bad channels detected: {bad_indices.tolist()} ({len(bad_indices)}/{n_channels})")
+        
+        # Interpolate: replace each bad channel with mean of nearest good neighbors
+        good_indices = np.where(~bad_mask)[0]
+        result = data_np.copy()
+        
+        for bad_ch in bad_indices:
+            # Find nearest good neighbors
+            distances = np.abs(good_indices - bad_ch)
+            n_neighbors = min(2, len(good_indices))  # Use 2 nearest good channels
+            nearest = good_indices[np.argsort(distances)[:n_neighbors]]
+            result[:, bad_ch] = np.mean(data_np[:, nearest], axis=1)
+        
+        if _HAS_CUPY and self.xp is cp:
+            return cp.array(result)
+        elif _HAS_TORCH and self.xp is torch:
+            return torch.tensor(result, device=self.device, dtype=torch.float32)
+        return result
+
+    def _apply_whitening(self, data: np.ndarray) -> np.ndarray:
+        """Apply ZCA whitening: decorrelate channels and equalize noise variance."""
+        # Work in numpy for covariance estimation
+        if _HAS_CUPY and self.xp is cp:
+            data_np = cp.asnumpy(data).astype(np.float64)
+        elif _HAS_TORCH and self.xp is torch:
+            data_np = data.cpu().numpy().astype(np.float64)
+        else:
+            data_np = data.astype(np.float64)
+        
+        # Estimate covariance from random chunks (cap at 100k samples for speed)
+        n_samples = data_np.shape[0]
+        if n_samples > 100000:
+            idx = np.random.choice(n_samples, 100000, replace=False)
+            sample = data_np[idx]
+        else:
+            sample = data_np
+        
+        cov = np.cov(sample.T)
+        if cov.ndim < 2:
+            return data  # Single channel, nothing to whiten
+        
+        # ZCA whitening: W = cov^(-1/2)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        # Regularize: clamp small eigenvalues to 1% of the largest
+        reg_floor = max(np.max(eigvals) * 0.01, 1e-6)
+        eigvals = np.maximum(eigvals, reg_floor)
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(eigvals))
+        W = eigvecs @ D_inv_sqrt @ eigvecs.T
+        
+        # Apply whitening
+        whitened = data_np @ W.T
+        
+        # Guard against numerical issues
+        if np.any(~np.isfinite(whitened)):
+            logger.warning("Whitening produced non-finite values, skipping whitening step")
+            return data
+        
+        if _HAS_CUPY and self.xp is cp:
+            return cp.array(whitened.astype(np.float32))
+        elif _HAS_TORCH and self.xp is torch:
+            return torch.tensor(whitened, device=self.device, dtype=torch.float32)
+        return whitened.astype(np.float32)
+
     def _detect_spikes(self, filtered_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Detect spikes in filtered data.
-        
-        Args:
-            filtered_data: Filtered data array (samples x channels)
-        
-        Returns:
-            Tuple of (spike_times, spike_channels)
-        """
+        """Detect spikes per channel. Returns (spike_times, spike_channels) arrays."""
         detection_method = self.config.detection_method
         threshold = self.config.detection_threshold
         
@@ -1060,17 +1365,7 @@ class SpeedSort:
 
     def _extract_waveforms(self, filtered_data: np.ndarray, spike_times: np.ndarray, 
                           spike_channels: np.ndarray) -> np.ndarray:
-        """
-        Extract waveforms around detected spike times.
-        
-        Args:
-            filtered_data: Filtered data array (samples x channels)
-            spike_times: Array of spike timestamp indices
-            spike_channels: Array of channel indices corresponding to spike_times
-        
-        Returns:
-            Array of waveforms (n_spikes x n_samples x n_channels)
-        """
+        """Cut waveform snippets around each spike. Returns array (n_spikes, n_samples, n_channels)."""
         if len(spike_times) == 0:
             return np.array([])
         
@@ -1122,15 +1417,7 @@ class SpeedSort:
         return waveforms
 
     def _compute_features(self, waveforms: np.ndarray) -> np.ndarray:
-        """
-        Compute features from spike waveforms.
-        
-        Args:
-            waveforms: Array of waveforms (n_spikes x n_samples x n_channels)
-        
-        Returns:
-            Feature array (n_spikes x n_features)
-        """
+        """Reduce waveforms to feature vectors via PCA, t-SNE, UMAP, or wavelets. Returns (n_spikes, n_features)."""
         if len(waveforms) == 0:
             return np.array([])
         
@@ -1289,15 +1576,7 @@ class SpeedSort:
         return features
 
     def _compute_wavelet_features(self, waveforms: Union[np.ndarray, 'cp.ndarray', 'torch.Tensor']) -> np.ndarray:
-        """
-        Compute wavelet coefficients as features.
-        
-        Args:
-            waveforms: Array of waveforms (n_spikes x n_samples x n_channels)
-        
-        Returns:
-            Feature array (n_spikes x n_features)
-        """
+        """Extract wavelet decomposition coefficients as features. Fallback: simple peak/width/energy features."""
         try:
             import pywt
             
@@ -1417,15 +1696,7 @@ class SpeedSort:
             return features
 
     def _cluster_spikes(self, features: np.ndarray) -> np.ndarray:
-        """
-        Cluster spikes based on extracted features.
-        
-        Args:
-            features: Feature array (n_spikes x n_features)
-        
-        Returns:
-            Cluster labels for each spike
-        """
+        """Cluster feature vectors into spike units. Returns integer label per spike."""
         if len(features) == 0:
             return np.array([])
         
@@ -1485,19 +1756,7 @@ class SpeedSort:
         return labels
 
     def _create_units(self, waveforms: np.ndarray, spike_times: np.ndarray, spike_channels: np.ndarray, features: np.ndarray, labels: np.ndarray) -> List[SpikeUnit]:
-        """
-        Create spike units from clustering results.
-        
-        Args:
-            waveforms: Array of waveforms (n_spikes x n_samples x n_channels)
-            spike_times: Array of spike timestamp indices
-            spike_channels: Array of channel indices corresponding to spike_times
-            features: Feature array (n_spikes x n_features)
-            labels: Cluster labels for each spike
-        
-        Returns:
-            List of SpikeUnit objects
-        """
+        """Group spikes by cluster label into SpikeUnit objects."""
         units = []
         unique_labels = np.unique(labels)
         
@@ -1528,30 +1787,128 @@ class SpeedSort:
         return units
 
     def _compute_quality_metrics(self, units: List[SpikeUnit], features: np.ndarray, labels: np.ndarray) -> Dict[str, Dict[str, float]]:
-        """
-        Compute quality metrics for each spike unit.
-        
-        Args:
-            units: List of SpikeUnit objects
-            features: Feature array (n_spikes x n_features)
-            labels: Cluster labels for each spike
-        
-        Returns:
-            Dictionary of quality metrics for each unit
-        """
+        """Compute real quality metrics for each unit: firing rate, presence ratio, ISI violations, SNR, isolation distance, silhouette score."""
         quality_metrics = {}
+        
+        # Recording duration in seconds
+        if len(units) == 0:
+            return quality_metrics
+        all_times = np.concatenate([u.timestamps for u in units if len(u.timestamps) > 0])
+        if len(all_times) == 0:
+            return quality_metrics
+        duration_sec = (all_times.max() - all_times.min()) / self.config.sampling_rate
+        if duration_sec <= 0:
+            duration_sec = 1.0  # Avoid division by zero
+        
+        # Refractory period in samples (1.5 ms)
+        refractory_samples = int(0.0015 * self.config.sampling_rate)
+        
+        # Compute per-unit silhouette scores if sklearn is available and we have enough labels
+        per_unit_silhouette = {}
+        unique_labels_clean = np.array([u.unit_id for u in units])
+        if _HAS_SKLEARN and len(unique_labels_clean) > 1 and len(features) > 0:
+            try:
+                # Only use non-noise labels
+                valid_mask = labels >= 0
+                if valid_mask.sum() > 1 and len(np.unique(labels[valid_mask])) > 1:
+                    from sklearn.metrics import silhouette_samples
+                    sample_scores = silhouette_samples(features[valid_mask], labels[valid_mask])
+                    valid_labels = labels[valid_mask]
+                    for uid in unique_labels_clean:
+                        uid_mask = valid_labels == uid
+                        if uid_mask.sum() > 0:
+                            per_unit_silhouette[uid] = float(np.mean(sample_scores[uid_mask]))
+            except Exception as e:
+                logger.warning(f"Could not compute silhouette scores: {e}")
         
         for unit in units:
             unit_id = unit.unit_id
             unit_metrics = {}
+            n_spikes = len(unit.timestamps)
             
-            # Example metric: Isolation distance
+            # 1. Firing rate (Hz)
+            unit_metrics['firing_rate'] = n_spikes / duration_sec if n_spikes > 0 else 0.0
+            
+            # 2. Presence ratio: fraction of 1-second bins containing at least 1 spike
+            if n_spikes > 0:
+                bin_size_samples = int(self.config.sampling_rate)  # 1 second
+                min_t, max_t = all_times.min(), all_times.max()
+                n_bins = max(1, int(np.ceil((max_t - min_t) / bin_size_samples)))
+                spike_bins = ((unit.timestamps - min_t) / bin_size_samples).astype(int)
+                spike_bins = np.clip(spike_bins, 0, n_bins - 1)
+                occupied_bins = len(np.unique(spike_bins))
+                unit_metrics['presence_ratio'] = occupied_bins / n_bins
+            else:
+                unit_metrics['presence_ratio'] = 0.0
+            
+            # 3. ISI violations ratio: fraction of spikes with ISI < refractory period
+            if n_spikes > 1:
+                sorted_times = np.sort(unit.timestamps)
+                isis = np.diff(sorted_times)
+                n_violations = np.sum(isis < refractory_samples)
+                unit_metrics['isi_violations_ratio'] = n_violations / n_spikes
+                unit_metrics['isi_violations_count'] = int(n_violations)
+            else:
+                unit_metrics['isi_violations_ratio'] = 0.0
+                unit_metrics['isi_violations_count'] = 0
+            
+            # 4. SNR: peak amplitude of mean waveform / noise std
+            if n_spikes > 0 and unit.waveforms is not None and len(unit.waveforms) > 0:
+                try:
+                    if unit.waveforms.ndim == 3:
+                        # (n_spikes, n_samples, n_channels) -> mean over spikes, take peak channel
+                        mean_waveform = np.mean(unit.waveforms, axis=0)  # (n_samples, n_channels)
+                        # Find peak channel (largest absolute amplitude)
+                        peak_ch = np.argmax(np.max(np.abs(mean_waveform), axis=0))
+                        wf = mean_waveform[:, peak_ch]
+                    elif unit.waveforms.ndim == 2:
+                        wf = np.mean(unit.waveforms, axis=0)
+                    else:
+                        wf = unit.waveforms.flatten()
+                    
+                    peak_amplitude = np.max(np.abs(wf))
+                    # Noise estimate from first/last 10% of waveform (baseline)
+                    n_baseline = max(1, len(wf) // 10)
+                    baseline = np.concatenate([wf[:n_baseline], wf[-n_baseline:]])
+                    noise_std = np.std(baseline)
+                    unit_metrics['snr'] = float(peak_amplitude / noise_std) if noise_std > 0 else 0.0
+                except Exception:
+                    unit_metrics['snr'] = 0.0
+            else:
+                unit_metrics['snr'] = 0.0
+            
+            # 5. Isolation distance (Mahalanobis-based)
             unit_indices = np.where(labels == unit_id)[0]
-            if len(unit_indices) > 0:
-                # Compute isolation distance or other metrics here
-                unit_metrics['isolation_distance'] = np.random.rand()  # Placeholder
-                unit_metrics['contamination'] = np.random.rand()  # Placeholder
+            other_indices = np.where((labels != unit_id) & (labels >= 0))[0]
+            if len(unit_indices) > 1 and len(other_indices) > 1 and len(features) > 0:
+                try:
+                    unit_feats = features[unit_indices]
+                    other_feats = features[other_indices]
+                    # Covariance of the unit cluster
+                    cov = np.cov(unit_feats.T)
+                    if cov.ndim < 2:
+                        cov = np.array([[cov]])
+                    cov += np.eye(cov.shape[0]) * 1e-6  # Regularize
+                    cov_inv = np.linalg.inv(cov)
+                    mean_unit = np.mean(unit_feats, axis=0)
+                    # Mahalanobis distances of other spikes to unit centroid
+                    diff = other_feats - mean_unit
+                    mahal_dists = np.sum(diff @ cov_inv * diff, axis=1)
+                    mahal_dists_sorted = np.sort(mahal_dists)
+                    # Isolation distance = Mahalanobis distance at the n_unit-th nearest other spike
+                    idx = min(len(unit_indices), len(mahal_dists_sorted)) - 1
+                    unit_metrics['isolation_distance'] = float(mahal_dists_sorted[idx])
+                except Exception:
+                    unit_metrics['isolation_distance'] = 0.0
+            else:
+                unit_metrics['isolation_distance'] = 0.0
+            
+            # 6. Silhouette score (per-unit)
+            unit_metrics['silhouette_score'] = per_unit_silhouette.get(unit_id, 0.0)
             
             quality_metrics[unit_id] = unit_metrics
+            
+            # Also store in the unit object
+            unit.quality_metrics = unit_metrics
         
         return quality_metrics

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""CLI entry point for SpeedSort. Parses arguments, runs the spike sorting pipeline, and saves results."""
 
 import os
 import sys

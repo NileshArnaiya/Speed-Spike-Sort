@@ -1,94 +1,108 @@
-# SpeedSort: High-Performance Neural Spike Sorting Framework
+# SpeedSort
 
-## Overview
+A Python spike sorting pipeline for extracellular electrophysiology recordings.
 
-SpeedSort is a high-performance framework for neural spike sorting created by Bibby AI - Latex writing tool for researchers, designed to handle various electrophysiology data formats with minimal configuration requirements. It supports GPU acceleration, adaptive dimensionality reduction, and integrated quality metrics for automated unit verification.
+## What It Does
 
-## Features
+SpeedSort takes a raw neural recording and produces sorted spike units. The pipeline:
 
-- Universal data format handling with automatic detection
-- GPU-accelerated preprocessing and clustering when available
-- Adaptive dimensionality reduction and feature selection
-- Parallelized processing for multi-channel recordings
-- Integrated quality metrics with automated unit verification
-- Minimal configuration with intelligent defaults
+1. **Filter** — Bandpass + notch filter to isolate spike-band activity (default 300–6000 Hz)
+2. **Detect** — Find spikes via amplitude thresholding (static, adaptive, NEO, wavelet, or neural net)
+3. **Extract** — Cut waveform snippets around each detected spike
+4. **Reduce** — Dimensionality reduction on waveforms (PCA, t-SNE, UMAP, or wavelet coefficients)
+5. **Cluster** — Group spikes into units (K-means, GMM, DBSCAN, mean shift, agglomerative, etc.)
+6. **Score** — Compute isolation distance and contamination metrics per unit
+
+**Input:** `.npy`, `.nwb`, `.mda`, or raw binary files (auto-detected from extension)
+**Output:** A `.pkl` file containing sorted units with waveforms, timestamps, features, and quality metrics
+
+GPU acceleration via PyTorch/CuPy is used automatically when available.
 
 ## Installation
 
-To run this project, you need to have Python 3.6 or higher installed. You can clone the repository and install the required dependencies using pip.
+Requires Python 3.6+.
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/NileshArnaiya/Speed-Spike-Sort.git
-   cd speed-spike-sort
-   ```
+```bash
+git clone https://github.com/NileshArnaiya/Speed-Spike-Sort.git
+cd Speed-Spike-Sort
+pip install -r requirements.txt
+```
 
-2. Install the required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-   Make sure to install `pynwb`, `numpy`, `scipy`, `pandas`, and `scikit-learn`. If you want to use GPU acceleration, install `torch` and `cupy` as well.
+Core dependencies: `numpy`, `scipy`, `pandas`, `scikit-learn`, `pynwb`.
+Optional (GPU): `torch`, `cupy`.
 
 ## Usage
 
-To run the spike sorting process, you can use the provided `spike-sort-run.py` script. Here's how to execute it:
+### Basic
 
 ```bash
-python feuapp/spike-sort-run.py --data <path_to_your_data_file> --sampling-rate <sampling_rate> --data-format <data_format>
+python spike-sort-run.py --data recording.npy --sampling-rate 30000
 ```
 
-### Command Line Arguments
-
-- `--data`: Path to the input data file (required).
-- `--sampling-rate`: Sampling rate in Hz (default: 30000).
-- `--data-format`: Data format (options: `numpy`, `binary`, `neo`, `nwb`, `mda`, `auto`, default: `auto`).
-- `--use-gpu`: Use GPU acceleration if available (optional).
-- `--jobs`: Number of parallel jobs (default: number of CPU cores - 1).
-- `--filter-low`: Low cutoff frequency in Hz (default: 300).
-- `--filter-high`: High cutoff frequency in Hz (default: 6000).
-- `--detection-method`: Spike detection method (default: `threshold_dynamic`).
-- `--max-clusters`: Maximum number of clusters to detect (default: 50).
-- `--min-cluster-size`: Minimum number of spikes per cluster (default: 30).
-- `--output`: Path to save results (default: `spike_sorting_results.pkl`).
-
-### Example
+### Full Options
 
 ```bash
-python spike-sort-run.py --data test_data/random_numpy_data.npy --sampling-rate 30000 --max-clusters 5 --data-format nwb
+python spike-sort-run.py \
+  --data recording.nwb \
+  --sampling-rate 30000 \
+  --data-format nwb \
+  --use-gpu \
+  --detection-method threshold_dynamic \
+  --detection-threshold 4.5 \
+  --filter-low 300 \
+  --filter-high 6000 \
+  --max-clusters 10 \
+  --min-cluster-size 30 \
+  --output results.pkl
 ```
 
-## Contributing
+### Arguments
 
-We welcome contributions to SpeedSort! If you would like to contribute, please follow these steps:
+| Argument | Default | Description |
+|---|---|---|
+| `--data` | — | Path to input data file (required) |
+| `--sampling-rate` | 30000 | Sampling rate in Hz |
+| `--data-format` | auto | `numpy`, `binary`, `neo`, `nwb`, `mda`, or `auto` |
+| `--use-gpu` | off | Use GPU acceleration if available |
+| `--jobs` | CPU count - 1 | Number of parallel jobs |
+| `--filter-low` | 300 | Bandpass low cutoff (Hz) |
+| `--filter-high` | 6000 | Bandpass high cutoff (Hz) |
+| `--detection-method` | threshold_dynamic | `threshold`, `threshold_dynamic`, `neo`, `wavelet` |
+| `--detection-threshold` | 4.5 | Threshold in MADs |
+| `--max-clusters` | 50 | Maximum clusters to detect |
+| `--min-cluster-size` | 30 | Minimum spikes per cluster |
+| `--output` | spike_sorting_results.pkl | Output file path |
 
-1. Fork the repository.
-2. Create a new branch for your feature or bug fix:
-   ```bash
-   git checkout -b feature/my-feature
-   ```
-3. Make your changes and commit them:
-   ```bash
-   git commit -m "Add some feature"
-   ```
-4. Push your changes to your fork:
-   ```bash
-   git push origin feature/my-feature
-   ```
-5. Create a pull request describing your changes.
+### Download Test Data from DANDI
+
+```bash
+python download_dandi_sample.py --dandiset-id 000006 --max-samples 60000
+```
+
+This downloads an NWB file from the [DANDI Archive](https://dandiarchive.org/) and extracts a `.npy` snippet you can use for testing.
+
+### Python API
+
+```python
+from spikesort import SpeedSort, SpikeSortingConfiguration
+
+config = SpikeSortingConfiguration(sampling_rate=30000, max_clusters=10)
+sorter = SpeedSort(config)
+results = sorter.run("recording.npy")
+
+print(results.summary())
+results.save("results.pkl")
+```
+
+## Project Structure
+
+```
+spikesort.py              # Core library: data loading, filtering, detection, clustering
+spike-sort-run.py         # CLI entry point
+download_dandi_sample.py  # Download NWB test data from DANDI
+synthetic_spikes.npy      # Bundled synthetic test data
+```
 
 ## License
 
-This project is licensed under the GNU Public License. See the LICENSE file for details.
-
-## Acknowledgments
-
-- [NumPy](https://numpy.org/)
-- [SciPy](https://www.scipy.org/)
-- [Pandas](https://pandas.pydata.org/)
-- [PyTorch](https://pytorch.org/)
-- [CuPy](https://cupy.chainer.org/)
-- [scikit-learn](https://scikit-learn.org/stable/)
-- [MNE-Python](https://mne.tools/stable/index.html)
-
-Powered by Bibby AI - Latex writing tool for researchers
+GNU General Public License. See [LICENSE](LICENSE).

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Download NWB sample files from the DANDI Archive and extract numpy arrays for testing the spike sorter."""
 
 import os
 import sys
