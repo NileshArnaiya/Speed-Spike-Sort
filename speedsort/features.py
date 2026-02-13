@@ -293,3 +293,65 @@ def _simple_waveform_features(waveforms, config, xp):
             features[i, 6:6+len(samples)] = samples
 
     return features
+
+
+# ---------------------------------------------------------------------------
+# Multi-channel spatial features (P3)
+# ---------------------------------------------------------------------------
+
+def compute_spatial_features(
+    waveforms: np.ndarray,
+    spike_channels: np.ndarray,
+    n_neighbor_channels: int = 3,
+) -> np.ndarray:
+    """Compute spatial spread features from multi-channel waveforms.
+
+    For each spike, computes:
+        1. peak_channel         — channel with largest absolute amplitude
+        2. spatial_spread       — std of peak amplitudes across neighbor channels
+        3. amplitude_ratio      — ratio of 2nd-largest to largest channel amplitude
+        4. center_of_mass       — amplitude-weighted mean channel index
+
+    Args:
+        waveforms: (n_spikes, n_samples, n_channels)
+        spike_channels: detected channel per spike (used as center for neighborhood)
+        n_neighbor_channels: how many channels on each side to include
+
+    Returns:
+        (n_spikes, 4) feature array
+    """
+    if waveforms.ndim != 3 or waveforms.shape[0] == 0:
+        return np.zeros((max(1, len(spike_channels)), 4))
+
+    n_spikes, n_samples, n_channels = waveforms.shape
+    features = np.zeros((n_spikes, 4), dtype=np.float32)
+
+    for i in range(n_spikes):
+        wf = waveforms[i]  # (n_samples, n_channels)
+
+        # Peak amplitude on each channel (absolute minimum = trough)
+        channel_amps = np.abs(np.min(wf, axis=0))  # shape (n_channels,)
+
+        # 1. Peak channel
+        peak_ch = int(np.argmax(channel_amps))
+        features[i, 0] = peak_ch
+
+        # Neighborhood
+        lo = max(0, peak_ch - n_neighbor_channels)
+        hi = min(n_channels, peak_ch + n_neighbor_channels + 1)
+        neighbor_amps = channel_amps[lo:hi]
+
+        # 2. Spatial spread — std of amplitudes across neighbors
+        features[i, 1] = float(np.std(neighbor_amps)) if len(neighbor_amps) > 1 else 0.0
+
+        # 3. Amplitude ratio — 2nd largest / largest
+        sorted_amps = np.sort(channel_amps)[::-1]
+        if sorted_amps[0] > 1e-12 and len(sorted_amps) > 1:
+            features[i, 2] = sorted_amps[1] / sorted_amps[0]
+
+        # 4. Center of mass
+        total = np.sum(neighbor_amps) + 1e-12
+        channel_indices = np.arange(lo, hi, dtype=np.float32)
+        features[i, 3] = float(np.sum(neighbor_amps * channel_indices) / total)
+
+    return features

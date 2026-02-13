@@ -27,9 +27,11 @@ from speedsort.preprocessing import (
     filter_data,
 )
 from speedsort.detection import detect_spikes
-from speedsort.features import compute_features, extract_waveforms
+from speedsort.features import compute_features, compute_spatial_features, extract_waveforms
 from speedsort.clustering import cluster_spikes, create_units
 from speedsort.quality import compute_quality_metrics
+from speedsort.curation import auto_merge_units, reject_noise_units
+from speedsort.template_matching import template_match_and_subtract
 
 if _HAS_CUPY:
     import cupy as cp
@@ -40,7 +42,10 @@ logger = logging.getLogger("speedsort")
 
 
 class SpeedSort:
-    """Runs the full spike sorting pipeline: load → filter → detect → extract → cluster → score."""
+    """Runs the full spike sorting pipeline:
+    load → filter → detect → extract → features (+spatial) → cluster
+    → template match → quality metrics → auto-merge → noise rejection.
+    """
 
     def __init__(self, config: Optional[SpikeSortingConfiguration] = None):
         """Initialize with a SpikeSortingConfiguration (uses defaults if None)."""
@@ -134,6 +139,15 @@ class SpeedSort:
         logger.info("Computing features...")
         features = compute_features(waveforms, self.config, self.xp, self.device)
 
+        # Step 5b: Append spatial features (P3)
+        if self.config.use_spatial_features and len(waveforms) > 0 and waveforms.ndim == 3:
+            logger.info("Computing spatial features...")
+            spatial = compute_spatial_features(
+                waveforms, spike_channels, self.config.n_neighbor_channels
+            )
+            if len(features) > 0 and len(spatial) == len(features):
+                features = np.hstack([features, spatial])
+
         # Step 6: Cluster
         logger.info("Clustering spikes...")
         labels = cluster_spikes(features, self.config)
@@ -142,12 +156,46 @@ class SpeedSort:
         logger.info("Creating units...")
         units = create_units(waveforms, spike_times, spike_channels, features, labels)
 
+        # Step 7b: Template matching / deconvolution (P3)
+        if self.config.template_matching and len(units) > 0:
+            logger.info("Running template matching...")
+            units, _ = template_match_and_subtract(
+                filtered, units, self.config,
+                max_iterations=self.config.template_matching_iterations,
+                residual_threshold_factor=self.config.template_residual_threshold,
+            )
+
         # Step 8: Quality metrics
         if self.config.compute_quality_metrics:
             logger.info("Computing quality metrics...")
             qm = compute_quality_metrics(units, features, labels, self.config)
         else:
             qm = {}
+
+        # Step 8b: Auto-merge similar units (P3)
+        if self.config.auto_merge and len(units) > 1:
+            logger.info("Auto-merging similar units...")
+            units = auto_merge_units(units, self.config)
+
+        # Step 8c: Noise rejection (P3)
+        if self.config.noise_rejection and len(units) > 0:
+            logger.info("Rejecting noise units...")
+            units = reject_noise_units(units, self.config)
+
+        # Recompute quality metrics if curation changed the units
+        if (self.config.auto_merge or self.config.noise_rejection) and self.config.compute_quality_metrics:
+            if len(units) > 0:
+                # Rebuild labels from remaining units
+                all_feats = []
+                all_labels = []
+                for unit in units:
+                    if unit.features is not None and len(unit.features) > 0:
+                        all_feats.append(unit.features)
+                        all_labels.extend([unit.unit_id] * len(unit.features))
+                if all_feats:
+                    features = np.vstack(all_feats)
+                    labels = np.array(all_labels)
+                qm = compute_quality_metrics(units, features, labels, self.config)
 
         execution_time = time.time() - start
 

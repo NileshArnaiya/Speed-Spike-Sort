@@ -174,6 +174,23 @@ class SpikeSortingConfiguration:
     isolation_threshold: float = 0.9          # Minimum isolation score to accept
     contamination_threshold: float = 0.1      # Maximum contamination to accept
 
+    # P3: Curation — auto-merge + noise rejection (after quality metrics)
+    auto_merge: bool = True                   # Merge units with similar templates
+    merge_template_threshold: float = 0.92    # Cosine similarity above which to merge
+    noise_rejection: bool = True              # Remove noise/artefact units
+    noise_isi_threshold: float = 0.05         # Max ISI violation ratio (5 %)
+    noise_snr_threshold: float = 1.5          # Min SNR to keep a unit
+    noise_firing_rate_bounds: Tuple[float, float] = (0.1, 200.0)  # Hz
+
+    # P3: Template matching / deconvolution
+    template_matching: bool = True            # Iterative template subtraction
+    template_matching_iterations: int = 2     # Max deconvolution passes
+    template_residual_threshold: float = 0.7  # Threshold factor for residual detection
+
+    # P3: Multi-channel spatial features
+    use_spatial_features: bool = True         # Append spatial spread features
+    n_neighbor_channels: int = 3              # Neighbors each side for spatial features
+
     # Output settings
     save_filtered_data: bool = False          # Save filtered data
     save_waveforms: bool = True               # Save extracted waveforms
